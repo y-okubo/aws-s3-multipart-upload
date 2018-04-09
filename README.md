@@ -1,1 +1,4 @@
-# aws-s3-multipart-upload
+# How to use
+```
+go run aws-multipart-upload.go [UploadFilePath]
+```
