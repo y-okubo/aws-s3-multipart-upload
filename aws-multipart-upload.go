@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -21,8 +22,8 @@ import (
 
 // Part defines part information
 type Part struct {
-	Number int
-	Buffer []byte
+	number int
+	buffer []byte
 }
 
 const (
@@ -64,8 +65,8 @@ func main() {
 	}
 	defer f.Close()
 
-	fi, _ := f.Stat()
-	size := fi.Size()
+	stat, _ := f.Stat()
+	size := stat.Size()
 	buf := make([]byte, size)
 	ct := http.DetectContentType(buf)
 	f.Read(buf)
@@ -85,63 +86,43 @@ func main() {
 		log.Println(err.Error())
 		return
 	}
+
 	log.Println("Created multipart upload request")
 
-	// Build parts
-	num := size / maxPartSize
-	if size%maxPartSize != 0 {
-		num++
-	}
-	var parts = make([]Part, num)
-	var current, length int64
-	var remaining = size
-	partNumber := 1
-	for current = 0; remaining != 0; current += length {
-		if remaining < maxPartSize {
-			length = remaining
-		} else {
-			length = maxPartSize
-		}
+	parts := divideFileIntoParts(buf)
+	length := len(parts)
 
-		parts[partNumber-1] = Part{
-			Number: partNumber,
-			Buffer: buf[current : current+length],
-		}
-
-		remaining -= length
-		partNumber++
-	}
-
-	log.Println("Total number of parts:", partNumber-1)
-
-	q := make(chan Part, partNumber-1)
-
-	// var completedParts []*s3.CompletedPart
-	var completedParts = make([]*s3.CompletedPart, num)
+	q := make(chan Part, length)
 
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
 	eg := errgroup.Group{}
 
+	var completedParts = make([]*s3.CompletedPart, length)
+
 	// Init workers
 	for i := 0; i < maxWorkers; i++ {
 		eg.Go(func() error {
 			for {
-				part, ok := <-q
-				if !ok {
-					return nil
-				}
-				completedPart, err := uploadPart(svc, resp, part.Buffer, part.Number)
-				if err != nil {
-					log.Println(err.Error())
-					err := abortMultipartUpload(svc, resp)
+				select {
+				case <-ctx.Done():
+					return fmt.Errorf("Worker canceled")
+				default:
+					part, ok := <-q
+					if !ok {
+						return nil
+					}
+					completedPart, err := uploadPart(svc, resp, part.buffer, part.number)
 					if err != nil {
 						log.Println(err.Error())
+						err := abortMultipartUpload(svc, resp)
+						if err != nil {
+							log.Println(err.Error())
+						}
+						return err
 					}
-					return err
+					completedParts[part.number-1] = completedPart
 				}
-				// completedParts = append(completedParts, completedPart)
-				completedParts[part.Number-1] = completedPart
 			}
 		})
 	}
@@ -153,12 +134,13 @@ func main() {
 
 	close(q)
 
-	cancel()
-
 	if err := eg.Wait(); err != nil {
-		log.Println("Error:", err.Error())
+		log.Println(err)
+		cancel()
 		return
 	}
+
+	cancel()
 
 	// PartNumber で並び替えしていないとエラーになるので対処
 	// sort.Slice(completedParts, func(i, j int) bool {
@@ -172,9 +154,44 @@ func main() {
 	}
 
 	log.Println("Successfully uploaded file:", completeResponse.String())
+
 	dTime := time.Now()
 	duration := dTime.Sub(sTime)
 	log.Println("Elapsed time:", duration)
+}
+
+func divideFileIntoParts(buf []byte) []Part {
+	contentSize := int64(len(buf))
+
+	size := contentSize / maxPartSize
+	if contentSize%maxPartSize != 0 {
+		size++
+	}
+
+	var parts = make([]Part, size)
+	var current, length int64
+	var remaining = contentSize
+	number := 1
+
+	for current = 0; remaining != 0; current += length {
+		if remaining < maxPartSize {
+			length = remaining
+		} else {
+			length = maxPartSize
+		}
+
+		parts[number-1] = Part{
+			number: number,
+			buffer: buf[current : current+length],
+		}
+
+		remaining -= length
+		number++
+	}
+
+	log.Println("Total number of parts:", size)
+
+	return parts
 }
 
 func completeMultipartUpload(svc *s3.S3, resp *s3.CreateMultipartUploadOutput, completedParts []*s3.CompletedPart) (*s3.CompleteMultipartUploadOutput, error) {
